@@ -1,11 +1,10 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.12;
 
-import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
 
-contract Escrow is Ownable{
+contract Escrow{
 
     enum STATE { AWAITING_DELIVERY, AWAITING_FUND_RELEASE, COMPLETE }
     struct ProductItem
@@ -51,8 +50,12 @@ contract Escrow is Ownable{
         bool completed;
     }
 
+    address public owner;
     address public priceFeedAddress;
     AggregatorV3Interface internal priceFeed;
+
+    mapping(address => bool) public managers;
+    mapping(address => bool) public bannedAddresses;
 
     mapping(uint256 => ProductItem) public productTrades;
     mapping(uint256 => ServiceItem) public serviceTrades;
@@ -62,12 +65,14 @@ contract Escrow is Ownable{
     uint256 public currentServiceTradeId;
     uint256 public currentCryptoTradeId;
 
+    uint256 public totalTax = 5; // $5
     uint256 public constant LOCK_TIME = 300; // 5 min
     address payable public teamWallet1 = payable(0x4b4a0CBB2A7c971D51Ae7dE040a7a290498Df74E);
     address payable public teamWallet2 = payable(0xCb10616fDfd7a5f3e3e144Aad8e7D7821DFAb6A2);
     address payable public teamWallet3 = payable(0x936A0cA35971Fe8A48000829f952e41293ea0DC8);
     address payable public teamWallet4 = payable(0x595F21963feDbc4f5BA4A11b76359dEe916040c0);
     address payable public teamWallet5 = payable(0xd136EB70B571cEf8Db36FAd5be07cB4F76905B64);
+    address payable public teamWallet6 = payable(0xd136EB70B571cEf8Db36FAd5be07cB4F76905B64);
 
     event NewTradeCreated(uint256 tradeId, uint256 category);
     event ProductDelivered(uint256 tradeId, string productLink, uint256 category);
@@ -75,13 +80,29 @@ contract Escrow is Ownable{
     event AppealRequested(uint256 tradeId, uint256 category);
     event AppealResolved(uint256 tradeId, bool buyerWin, uint256 category);
     event CryptoSold(uint256 cryptoTradeId);
+    event AdminsUpdated(address adminAddress, bool deleted);
+
+    modifier onlyOwner {
+      require(msg.sender == owner);
+      _;
+   }
+
+    modifier onlyManager {
+      require(msg.sender == owner || managers[msg.sender]);
+      _;
+   }
 
     constructor ()
     {
-        // Ethereum mainnet: 0x986b5E1e1755e3C2440e960477f25201B0a8bbD4
-        // Rinkeby testnet: 0xdCA36F27cbC4E38aE16C4E9f99D39b42337F6dcf
-        priceFeedAddress = 0xdCA36F27cbC4E38aE16C4E9f99D39b42337F6dcf;
+        // BNB mainnet: 0x45f86CA2A8BC9EBD757225B19a1A0D7051bE46Db
+        // BNB testnet: 0x2514895c72f50D8bd4B4F9b1110F0D6bD2c97526
+        priceFeedAddress = 0x2514895c72f50D8bd4B4F9b1110F0D6bD2c97526;
         priceFeed = AggregatorV3Interface(priceFeedAddress);
+        owner = msg.sender;
+    }
+
+    function setTax(uint256 _totalTax) external onlyOwner {
+        totalTax = _totalTax;
     }
 
     function getLatestPrice() public view returns (uint256) {
@@ -95,12 +116,31 @@ contract Escrow is Ownable{
         return uint256(price);
     }
 
+    function addManagers(address manager) external onlyOwner {
+        managers[manager] = true;
+        emit AdminsUpdated(manager, false);
+    }
+
+    function removeManagers(address manager) external onlyOwner {
+        managers[manager] = false;
+        emit AdminsUpdated(manager, true);
+    }
+
+    function manageBannedAddress(address illegalAddress, bool isAdd) external onlyOwner {
+        if (isAdd)
+            bannedAddresses[illegalAddress] = true;
+        else
+            bannedAddresses[illegalAddress] = false;
+    }
+
     /** 
      * @dev We always start a new trade from this function which will be called by Buyer
+     * @param _duration - in days - must be converted into seconds
      */
     function createNewTrade (string memory _chatRoomNumber, string memory _productName, uint256 _price, address _seller, uint256 _duration, uint256 category) external payable {
         require(msg.value >= _price, "Not enough deposit");
         require(category == 0 || category == 1, "invalid category value");
+        require(!bannedAddresses[msg.sender] && !bannedAddresses[_seller], "Banned address");
 
         if (category == 0) {
             ProductItem memory product;
@@ -124,7 +164,7 @@ contract Escrow is Ownable{
             service.buyer = payable(msg.sender);
             service.seller = payable(_seller);
             service.createTime = block.timestamp;
-            service.duration = _duration;
+            service.duration = _duration * 24 * 60 * 60;
             service.currentState = STATE.AWAITING_DELIVERY;
 
             currentServiceTradeId ++;
@@ -139,6 +179,7 @@ contract Escrow is Ownable{
      */
     function deliverProduct(uint256 tradeId, string memory _productLink, uint256 category) external {
         require(category == 0 || category == 1, "invalid category value");
+        
         if (category == 0) {
             ProductItem storage product = productTrades[tradeId];
             require(product.seller == msg.sender, "You are not the seller of this trade");
@@ -192,24 +233,20 @@ contract Escrow is Ownable{
 
     function payTax(uint256 price, bool success) internal returns(uint256 payAmount) {
         uint256 currentPrice = getLatestPrice();
-        uint256 tax1 = currentPrice / 2; // $ 0.5
-        uint256 tax2 = currentPrice / 2; // $ 0.5
-        uint256 tax3 = currentPrice / 2; // $ 0.5
-        uint256 tax4 = currentPrice * 3 / 2; // $ 1.5
-        uint256 tax5 = currentPrice * 2; // $ 2
 
-        (teamWallet1).transfer(tax1);
-        (teamWallet2).transfer(tax2);
-        (teamWallet3).transfer(tax3);
-        (teamWallet4).transfer(tax4);
-        (teamWallet5).transfer(tax5);
+        (teamWallet1).transfer(currentPrice * totalTax * 125 / 1000); // 12.5%
+        (teamWallet2).transfer(currentPrice * totalTax * 125 / 1000); // 12.5%
+        (teamWallet3).transfer(currentPrice * totalTax * 125 / 1000); // 12.5%
+        (teamWallet4).transfer(currentPrice * totalTax * 20 / 100);   // 20%
+        (teamWallet5).transfer(currentPrice * totalTax * 375 / 1000); // 37.5%
+        (teamWallet6).transfer(currentPrice * totalTax * 5 / 100);    // 5%
 
-        uint256 tax6;
+        uint256 tax7;
         if (success)
-            tax6 = price / 100;
+            tax7 = price / 100;
         else
-            tax6 = price / 200;
-        payAmount = price - tax1 - tax2 - tax3 - tax4 - tax5 - tax6;
+            tax7 = price / 200;
+        payAmount = price - currentPrice * totalTax - tax7;
     }
 
     /** 
@@ -240,7 +277,7 @@ contract Escrow is Ownable{
      * @param buyerWin denotes whether buyer won: true for the buyer and false for the seller
      * @param category denotes 0: product, 1: service
      */
-    function resolveAppeal(uint256 tradeId, bool buyerWin, uint256 category) external onlyOwner {
+    function resolveAppeal(uint256 tradeId, bool buyerWin, uint256 category) external onlyManager {
         require(category == 0 || category == 1, "invalid category value");
         
         if (category == 0) {
@@ -256,6 +293,7 @@ contract Escrow is Ownable{
                 (product.seller).transfer(payAmount);
 
             product.currentState = STATE.COMPLETE;
+            product.appeal = false;
         }
         else {
             ServiceItem storage service = serviceTrades[tradeId];
@@ -270,6 +308,7 @@ contract Escrow is Ownable{
                 (service.seller).transfer(payAmount);
 
             service.currentState = STATE.COMPLETE;
+            service.appeal = false;
         }
         emit AppealResolved(tradeId, buyerWin, category);
     }
@@ -338,6 +377,8 @@ contract Escrow is Ownable{
      * @param _price price of crypto currency in BNB
      */
     function createNewCryptoTrade (address _currencyAddress, uint256 _amount, uint256 _price) external {
+        require(!bannedAddresses[msg.sender], "Banned address");
+
         IERC20Metadata token = IERC20Metadata(_currencyAddress);
         uint256 allowance = token.allowance(msg.sender, address(this));
         require(allowance >= _amount, "Check the token allowance");
